@@ -8,6 +8,7 @@ GET    /api/analyses/{id}              fetch one version with the full result
 GET    /api/analyses/{id}/rules        query rules (filters: status/action/ip_version)
 GET    /api/analyses/{id}/findings     query findings (filters: severity/behavioral_only)
 GET    /api/analyses/{id}/export.json  download the result as a JSON file
+GET    /api/analyses/{id}/diff/{oid}   effective-action semantic diff of two versions
 GET    /health                         liveness probe
 """
 
@@ -24,6 +25,7 @@ from fastapi.responses import JSONResponse
 from . import __version__
 from .analyzer import ANALYZER_VERSION, ValidationError, analyze_rules
 from . import db
+from .diff import ANALYSIS_ID_RE, diff_analyses
 from .schemas import AnalyzeRequest
 
 
@@ -152,3 +154,33 @@ def export_analysis(analysis_id: str) -> Response:
         media_type="application/json",
         headers={"Content-Disposition": f'attachment; filename="{analysis_id}.json"'},
     )
+
+
+@app.get("/api/analyses/{base_id}/diff/{target_id}")
+def diff_versions(base_id: str, target_id: str) -> dict[str, Any]:
+    """Compare final effective actions of two saved versions.
+
+    Every address covered by either version is classified by its effective
+    action in each version (``permit``/``deny``, ``none`` when no rule
+    matches).  Only addresses whose action changed are returned, as minimal
+    CIDR ranges grouped by the six change types; adjacent ranges of the same
+    type are merged.
+    """
+    bad = [i for i in (base_id, target_id) if not ANALYSIS_ID_RE.match(i)]
+    if bad:
+        raise HTTPException(
+            status_code=400,
+            detail=f"invalid analysis id format: {', '.join(sorted(set(bad)))}; "
+            "expected 'an_' followed by 16 lowercase hexadecimal characters",
+        )
+    if base_id == target_id:
+        raise HTTPException(status_code=400, detail="base and target ids must differ")
+
+    base = db.get_analysis(base_id)
+    if base is None:
+        raise HTTPException(status_code=404, detail=f"analysis '{base_id}' not found")
+    target = db.get_analysis(target_id)
+    if target is None:
+        raise HTTPException(status_code=404, detail=f"analysis '{target_id}' not found")
+
+    return diff_analyses(base, target)

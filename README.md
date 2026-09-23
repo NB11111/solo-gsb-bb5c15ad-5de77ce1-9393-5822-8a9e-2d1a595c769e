@@ -98,6 +98,7 @@ N 的实际覆盖碎片。
 | GET | `/api/analyses/{id}/rules` | 查询规则：`status=active/partial/shadowed`、`action=permit/deny`、`ip=4/6` |
 | GET | `/api/analyses/{id}/findings` | 查询发现：`severity=conflict/warning/info`、`behavioral_only=true` |
 | GET | `/api/analyses/{id}/export.json` | 以附件形式导出完整结果 JSON |
+| GET | `/api/analyses/{base}/diff/{target}` | 两个已保存版本的**最终生效动作语义差异**（最小 CIDR + 分类计数） |
 | GET | `/health` | 健康检查 |
 
 ### 示例：提交分析
@@ -174,6 +175,53 @@ curl -s "http://localhost:8080/api/analyses/an_e38b58f57faf2325/findings?behavio
 curl -sOJ "http://localhost:8080/api/analyses/an_e38b58f57faf2325/export.json"
 ```
 
+### 版本语义差异（semantic diff）
+
+给定两个**已保存**版本 ID，逐地址比较它们的**最终生效动作**：地址落在某条 winner 规则的
+`effective_cidrs` 内取该规则动作（`permit`/`deny`），没有任何规则匹配记为 `none`。差异按
+六种变化类型分组——`permit_to_deny` / `permit_to_none` / `deny_to_permit` /
+`deny_to_none` / `none_to_permit` / `none_to_deny`，每类给出**最小 CIDR 范围**与地址数量。
+
+计算是纯几何的（CIDR 切割 + `ipaddress.collapse_addresses`），不枚举地址，IPv6 的超大空间
+（2¹²⁸）也能精确处理。**仅合并变化类型相同且相邻（同前缀兄弟块）的范围**；类型不同、或中间
+隔着未变化/空隙的范围不会合并。IPv4/IPv6 各自独立比较与汇总。
+
+```bash
+curl -s "http://localhost:8080/api/analyses/an_8914e028acea3413/diff/an_efdb05adb508e531"
+```
+
+响应（节选）：
+
+```json
+{
+  "base":   {"id": "an_8914...", "ruleset_hash": "8914...", "analyzer_version": "1.0.0"},
+  "target": {"id": "an_efdb...", "ruleset_hash": "efdb...", "analyzer_version": "1.0.0"},
+  "changes": [
+    {
+      "ip_version": 4,
+      "change_type": "deny_to_permit",
+      "from_action": "deny", "to_action": "permit",
+      "address_count": 65536, "range_count": 1,
+      "cidrs": ["10.1.0.0/16"]
+    }
+  ],
+  "summary": {
+    "total_changed_addresses": 65536,
+    "total_change_groups": 1,
+    "ipv4": {"changed_addresses": 65536, "change_groups": 1,
+             "by_type": {"permit_to_deny": 0, "permit_to_none": 0,
+                         "deny_to_permit": 65536, "deny_to_none": 0,
+                         "none_to_permit": 0, "none_to_deny": 0}},
+    "ipv6": {"changed_addresses": 0, "change_groups": 0, "by_type": { "...": 0 }}
+  }
+}
+```
+
+语义相同（即使规则形状不同）的两个版本返回空 `changes`。错误码：
+
+- ID 格式非法（不是 `an_` + 16 个小写十六进制字符）或两个 ID 相同 → `400`；
+- 任一版本不存在 → `404`（先做格式/同一性校验，再查存在性）。
+
 ### 错误处理
 
 - 非法 CIDR（语法错误、主机位非零、rule_id 重复等）→ `400`，形如
@@ -190,10 +238,12 @@ curl -sOJ "http://localhost:8080/api/analyses/an_e38b58f57faf2325/export.json"
 ├── app/
 │   ├── __init__.py
 │   ├── analyzer.py     # 核心引擎：CIDR 解析、trie、覆盖与最小冲突对（纯函数，可独立使用）
+│   ├── diff.py         # 版本语义差异：生效动作分区叠加 + 相邻同类范围合并（纯函数，可独立使用）
 │   ├── schemas.py      # Pydantic v2 请求/响应模型
 │   ├── db.py           # SQLite 持久层（analyses / rules / findings 三表）
 │   └── main.py         # FastAPI 路由
 ├── tests/test_api.py   # 端到端测试（pytest + TestClient）
+├── tests/test_diff.py  # 语义差异端点测试
 ├── requirements.txt
 ├── Dockerfile          # 非 root 运行、内置 HEALTHCHECK、暴露 8080
 ├── docker-compose.yml  # 单命令启动 + 命名卷持久化
