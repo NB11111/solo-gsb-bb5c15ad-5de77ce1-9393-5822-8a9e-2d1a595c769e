@@ -36,6 +36,7 @@ from __future__ import annotations
 
 import ipaddress
 import json
+from collections import Counter
 from dataclasses import dataclass, field
 from hashlib import sha256
 from typing import Any, Iterable
@@ -533,3 +534,209 @@ def analyze_rules(raw_rules: Any) -> dict[str, Any]:
 
 def _sort_nodes(nodes: Iterable[Node]) -> list[Node]:
     return sorted(nodes, key=lambda n: (n.network.version, int(n.network.network_address), n.network.prefixlen))
+
+
+# ---------------------------------------------------------------------------
+# Semantic diff between two saved analysis versions
+# ---------------------------------------------------------------------------
+# Every address resolves to one of three effective actions in a given version:
+# "permit", "deny", or "none" (no rule matches the address after LPM).  A
+# version's forwarding map is therefore a disjoint partition of the addresses
+# its rules actually cover into the winner rules' ``effective_cidrs``.
+SEMANTIC_ACTIONS = ("none", "permit", "deny")
+
+
+def _effective_intervals(result: dict[str, Any], version: int) -> list[tuple[int, int, str]]:
+    """Half-open integer intervals [start, end) actually forwarded per action.
+
+    The effective CIDR fragments of winner rules partition the covered address
+    space without overlap (duplicates/shadowed rules carry empty coverage), so
+    the returned intervals are pairwise disjoint.
+    """
+    intervals: list[tuple[int, int, str]] = []
+    for rule in result["rules"]:
+        if rule["ip_version"] != version or not rule["effective_cidrs"]:
+            continue
+        for cidr in rule["effective_cidrs"]:
+            net = ipaddress.ip_network(cidr)
+            intervals.append((int(net.network_address), int(net.broadcast_address) + 1, rule["action"]))
+    intervals.sort()
+    return intervals
+
+
+def _segments(
+    a_intervals: list[tuple[int, int, str]],
+    b_intervals: list[tuple[int, int, str]],
+) -> list[tuple[int, int, str, str]]:
+    """Sweep the two interval maps, yielding maximal constant-label segments.
+
+    Each segment is ``(start, end, action_in_base, action_in_target)`` and only
+    covers positions where at least one side has a matching rule — addresses
+    unmatched in both versions are outside the semantic comparison.
+    """
+    # +1 = interval start, -1 = interval end; ends are applied before starts
+    # at the same position so touching intervals of one side keep it active.
+    events: list[tuple[int, int, str, str]] = []  # (pos, kind, side, action)
+    for start, end, action in a_intervals:
+        events.append((start, 1, "a", action))
+        events.append((end, -1, "a", action))
+    for start, end, action in b_intervals:
+        events.append((start, 1, "b", action))
+        events.append((end, -1, "b", action))
+    events.sort(key=lambda e: (e[0], e[1]))
+
+    active: dict[str, str | None] = {"a": None, "b": None}
+    segments: list[tuple[int, int, str, str]] = []
+    seg_start: int | None = None
+    i = 0
+    while i < len(events):
+        pos = events[i][0]
+        if seg_start is not None and pos > seg_start:
+            segments.append(
+                (seg_start, pos, active["a"] or "none", active["b"] or "none")
+            )
+            seg_start = None
+        while i < len(events) and events[i][0] == pos:
+            _, kind, side, action = events[i]
+            # Intervals per side are disjoint, so an active action is simply
+            # replaced on start and cleared on end.
+            active[side] = action if kind == 1 else None
+            i += 1
+        if active["a"] is not None or active["b"] is not None:
+            seg_start = pos
+    return segments
+
+
+def _coalesce_changed(
+    segments: list[tuple[int, int, str, str]],
+) -> list[tuple[int, int, str, str]]:
+    """Keep changed segments, merging only adjacent ones of the same change.
+
+    Two consecutive segments are joined into one range exactly when the action
+    pair ``(base_action, target_action)`` is identical — merging across a
+    different change type (or across an unchanged gap) is forbidden.
+    """
+    merged: list[tuple[int, int, str, str]] = []
+    for start, end, act_a, act_b in segments:
+        if act_a == act_b:
+            continue
+        if merged and merged[-1][1] == start and merged[-1][2:] == (act_a, act_b):
+            prev_start, _, _, _ = merged[-1]
+            merged[-1] = (prev_start, end, act_a, act_b)
+        else:
+            merged.append((start, end, act_a, act_b))
+    return merged
+
+
+def _range_to_cidrs(start: int, end: int, version: int) -> list[str]:
+    """Cover the integer range ``[start, end)`` with the fewest aligned CIDRs."""
+    cls = ipaddress.IPv4Address if version == 4 else ipaddress.IPv6Address
+    max_prefix = 32 if version == 4 else 128
+    cidrs: list[str] = []
+    cur = start
+    while cur < end:
+        size = end - cur
+        # Largest block that fits the remaining range ...
+        prefix = max_prefix
+        while prefix > 0 and (1 << (max_prefix - prefix + 1)) <= size:
+            prefix -= 1
+        # ... and is aligned at the current position.
+        while cur & ((1 << (max_prefix - prefix)) - 1):
+            prefix += 1
+        block_size = 1 << (max_prefix - prefix)
+        cidrs.append(str(ipaddress.ip_network((int(cls(cur)), prefix), strict=True)))
+        cur += block_size
+    return cidrs
+
+
+def semantic_diff(base: dict[str, Any], target: dict[str, Any]) -> dict[str, Any]:
+    """Compute the effective-action diff between two analysis results.
+
+    Addresses unmatched by either version carry the action ``none``.  Output
+    ranges are minimal CIDR sets; adjacent ranges merge only when their change
+    type (ordered action pair) is the same.  IPv4 and IPv6 space are compared
+    independently.
+    """
+    changes_out: list[dict[str, Any]] = []
+    per_space: dict[str, dict[str, Any]] = {}
+    type_counts: Counter[str] = Counter()
+    type_addresses: Counter[str] = Counter()
+    total_changed = 0
+    cidr_total = 0
+
+    for version, space in ((4, "ipv4"), (6, "ipv6")):
+        segments = _segments(
+            _effective_intervals(base, version),
+            _effective_intervals(target, version),
+        )
+        merged = _coalesce_changed(segments)
+
+        space_counts: Counter[str] = Counter()
+        space_addresses: Counter[str] = Counter()
+        space_cidrs = 0
+        for start, end, act_a, act_b in merged:
+            change_type = f"{act_a}_to_{act_b}"
+            count = end - start
+            cidrs = _range_to_cidrs(start, end, version)
+            type_counts[change_type] += 1
+            type_addresses[change_type] += count
+            space_counts[change_type] += 1
+            space_addresses[change_type] += count
+            space_cidrs += len(cidrs)
+            total_changed += count
+            cidr_total += len(cidrs)
+            changes_out.append(
+                {
+                    "ip_version": version,
+                    "change_type": change_type,
+                    "base_action": act_a,
+                    "target_action": act_b,
+                    "cidrs": cidrs,
+                    "address_count": count,
+                }
+            )
+
+        per_space[space] = {
+            "change_range_count": sum(space_counts.values()),
+            "changed_addresses": sum(space_addresses.values()),
+            "cidr_count": space_cidrs,
+            "by_type": {
+                change_type: {
+                    "change_range_count": space_counts[change_type],
+                    "changed_addresses": space_addresses[change_type],
+                }
+                for change_type in sorted(space_counts)
+            },
+        }
+
+    changes_out.sort(
+        key=lambda c: (
+            c["ip_version"],
+            int(ipaddress.ip_network(c["cidrs"][0]).network_address),
+        )
+    )
+
+    empty_space = {
+        "change_range_count": 0,
+        "changed_addresses": 0,
+        "cidr_count": 0,
+        "by_type": {},
+    }
+    return {
+        "base_id": base.get("id"),
+        "target_id": target.get("id"),
+        "total_changed_addresses": total_changed,
+        "total_cidr_count": cidr_total,
+        "total_change_range_count": sum(type_counts.values()),
+        "by_change_type": {
+            change_type: {
+                "change_range_count": type_counts[change_type],
+                "changed_addresses": type_addresses[change_type],
+            }
+            for change_type in sorted(type_counts)
+        },
+        "ipv4": per_space.get("ipv4", empty_space),
+        "ipv6": per_space.get("ipv6", dict(empty_space)),
+        "changes": changes_out,
+    }
+

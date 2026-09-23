@@ -4,6 +4,7 @@ Endpoints
 ---------
 POST   /api/analyze                    analyze a rule set (optionally persist)
 GET    /api/analyses                   list saved analysis versions
+GET    /api/analyses/diff              semantic effective-action diff of two versions
 GET    /api/analyses/{id}              fetch one version with the full result
 GET    /api/analyses/{id}/rules        query rules (filters: status/action/ip_version)
 GET    /api/analyses/{id}/findings     query findings (filters: severity/behavioral_only)
@@ -14,6 +15,7 @@ GET    /health                         liveness probe
 from __future__ import annotations
 
 import json
+import re
 from contextlib import asynccontextmanager
 from hashlib import sha256
 from typing import Any
@@ -22,9 +24,11 @@ from fastapi import FastAPI, HTTPException, Query, Response
 from fastapi.responses import JSONResponse
 
 from . import __version__
-from .analyzer import ANALYZER_VERSION, ValidationError, analyze_rules
+from .analyzer import ANALYZER_VERSION, ValidationError, analyze_rules, semantic_diff
 from . import db
 from .schemas import AnalyzeRequest
+
+_ANALYSIS_ID_RE = re.compile(r"^an_[0-9a-f]{16}$")
 
 
 @asynccontextmanager
@@ -102,6 +106,40 @@ def list_analyses(
 ) -> dict[str, Any]:
     total, analyses = db.list_analyses(limit=limit, offset=offset)
     return {"total": total, "analyses": analyses}
+
+
+@app.get("/api/analyses/diff")
+def diff_analyses(
+    base: str = Query(..., description="Base analysis version id"),
+    target: str = Query(..., description="Target analysis version id"),
+) -> dict[str, Any]:
+    """Semantic diff of the effective forwarding actions of two saved versions.
+
+    Each address resolves to ``permit``/``deny`` (the action of the longest
+    matching winner rule) or ``none`` when no rule matches.  Only addresses
+    covered by at least one version participate.  Changed address runs are
+    returned as minimal CIDR ranges, merging adjacent ranges solely when their
+    change type is identical.
+    """
+    for label, analysis_id in (("base", base), ("target", target)):
+        if not _ANALYSIS_ID_RE.fullmatch(analysis_id):
+            raise HTTPException(
+                status_code=400,
+                detail=f"invalid {label} analysis id {analysis_id!r}; expected 'an_' followed by 16 hex characters",
+            )
+    if base == target:
+        raise HTTPException(
+            status_code=400, detail="base and target must be different analysis versions"
+        )
+
+    base_result = db.get_analysis(base)
+    if base_result is None:
+        raise HTTPException(status_code=404, detail=f"analysis '{base}' not found")
+    target_result = db.get_analysis(target)
+    if target_result is None:
+        raise HTTPException(status_code=404, detail=f"analysis '{target}' not found")
+
+    return semantic_diff(base_result, target_result)
 
 
 @app.get("/api/analyses/{analysis_id}")

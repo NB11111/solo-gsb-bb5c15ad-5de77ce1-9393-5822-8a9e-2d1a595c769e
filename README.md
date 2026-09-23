@@ -94,6 +94,7 @@ N 的实际覆盖碎片。
 | --- | --- | --- |
 | POST | `/api/analyze` | 分析规则集（默认保存；`save:false` 只算不存） |
 | GET | `/api/analyses` | 列出已保存版本（`limit`/`offset` 分页） |
+| GET | `/api/analyses/diff` | 两个已保存版本的**语义差异**（查询参数 `base`、`target`） |
 | GET | `/api/analyses/{id}` | 取某个版本的完整分析结果 |
 | GET | `/api/analyses/{id}/rules` | 查询规则：`status=active/partial/shadowed`、`action=permit/deny`、`ip=4/6` |
 | GET | `/api/analyses/{id}/findings` | 查询发现：`severity=conflict/warning/info`、`behavioral_only=true` |
@@ -174,12 +175,56 @@ curl -s "http://localhost:8080/api/analyses/an_e38b58f57faf2325/findings?behavio
 curl -sOJ "http://localhost:8080/api/analyses/an_e38b58f57faf2325/export.json"
 ```
 
+### 版本语义差异
+
+`GET /api/analyses/diff?base={id}&target={id}` 比较两个**已保存版本**中每个 IPv4/IPv6
+地址的**最终生效动作**：最长前缀命中的 winner 规则动作为 `permit`/`deny`，没有任何规则
+命中记为 `none`。只有至少被一个版本覆盖的地址参与比较（两版本都无规则匹配的地址忽略）。
+
+结果返回动作发生变化的地址段——以覆盖该段的**最小 CIDR 集合**表示，并给出每种变化类型
+（有序动作对，共 6 种：`none_to_permit`、`none_to_deny`、`permit_to_none`、`deny_to_none`、
+`permit_to_deny`、`deny_to_permit`）的变化范围数与地址数。**仅当相邻两段的变化类型完全
+相同时才合并**；被不同类型或"无变化"区间隔开的范围各自独立。IPv4 与 IPv6 独立比较，
+IPv6 的超大地址计数（如 2^96）以 JSON 数字返回。
+
+```bash
+curl -s "http://localhost:8080/api/analyses/diff?base=an_aaaa...&target=an_bbbb..."
+```
+
+```json
+{
+  "base_id": "an_aaaa...",
+  "target_id": "an_bbbb...",
+  "total_changed_addresses": 256,
+  "total_cidr_count": 2,
+  "total_change_range_count": 2,
+  "by_change_type": {
+    "permit_to_deny":  {"change_range_count": 1, "changed_addresses": 128},
+    "permit_to_none":  {"change_range_count": 1, "changed_addresses": 128}
+  },
+  "ipv4": {"change_range_count": 2, "changed_addresses": 256, "cidr_count": 2, "by_type": {}},
+  "ipv6": {"change_range_count": 0, "changed_addresses": 0, "cidr_count": 0, "by_type": {}},
+  "changes": [
+    {"ip_version": 4, "change_type": "permit_to_deny",
+     "base_action": "permit", "target_action": "deny",
+     "cidrs": ["10.0.0.0/25"], "address_count": 128},
+    {"ip_version": 4, "change_type": "permit_to_none",
+     "base_action": "permit", "target_action": "none",
+     "cidrs": ["10.0.0.128/25"], "address_count": 128}
+  ]
+}
+```
+
+差异是**有方向**的（`base → target`）；交换两个参数得到反向变化。ID 必须形如
+`an_` + 16 个十六进制字符：格式非法或两个 ID 相同 → `400`；任一版本不存在 → `404`。
+
 ### 错误处理
 
 - 非法 CIDR（语法错误、主机位非零、rule_id 重复等）→ `400`，形如
   `{"error": "invalid_ruleset", "detail": "rule #1: invalid CIDR '10.0.0.5/24' (...)"}`
 - 字段类型/取值错误（未知 action、空规则列表、多余字段等）→ `422`（Pydantic 校验错误）
 - 版本不存在 → `404`
+- 语义差异的版本 ID 格式非法或两个 ID 相同 → `400`；差异端点引用的版本不存在 → `404`
 
 ---
 

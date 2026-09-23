@@ -269,3 +269,183 @@ def test_save_false_is_not_persisted(client: TestClient) -> None:
     )
     assert r.json()["persisted"] is False
     assert client.get("/api/analyses").json()["total"] == 0
+
+
+# ---------------------------------------------------------------------------
+# Semantic diff between saved versions
+# ---------------------------------------------------------------------------
+def _submit(client: TestClient, rules: list[dict], name: str | None = None) -> str:
+    return client.post("/api/analyze", json={"name": name, "rules": rules}).json()["id"]
+
+
+def _diff(client: TestClient, base: str, target: str):
+    return client.get("/api/analyses/diff", params={"base": base, "target": target})
+
+
+def test_diff_basic_action_change_and_none(client: TestClient) -> None:
+    base = _submit(client, [{"cidr": "10.0.0.0/24", "action": "permit"}])
+    target = _submit(client, [{"cidr": "10.0.0.0/25", "action": "deny"}])
+
+    data = _diff(client, base, target).json()
+    assert data["base_id"] == base
+    assert data["target_id"] == target
+
+    by_type = {(c["change_type"]): c for c in data["changes"]}
+    assert by_type["permit_to_deny"]["cidrs"] == ["10.0.0.0/25"]
+    assert by_type["permit_to_deny"]["address_count"] == 128
+    assert by_type["permit_to_none"]["cidrs"] == ["10.0.0.128/25"]
+    assert by_type["permit_to_none"]["address_count"] == 128
+
+    assert data["total_changed_addresses"] == 256
+    assert data["total_change_range_count"] == 2
+    assert data["by_change_type"]["permit_to_deny"] == {
+        "change_range_count": 1,
+        "changed_addresses": 128,
+    }
+    assert data["ipv4"]["changed_addresses"] == 256
+    assert data["ipv6"]["changed_addresses"] == 0
+
+
+def test_diff_is_directional(client: TestClient) -> None:
+    base = _submit(client, [{"cidr": "10.0.0.0/24", "action": "permit"}])
+    target = _submit(client, [{"cidr": "10.0.0.0/24", "action": "deny"}])
+
+    forward = _diff(client, base, target).json()
+    assert [c["change_type"] for c in forward["changes"]] == ["permit_to_deny"]
+    reverse = _diff(client, target, base).json()
+    assert [c["change_type"] for c in reverse["changes"]] == ["deny_to_permit"]
+
+
+def test_diff_new_coverage_is_none_to_action(client: TestClient) -> None:
+    base = _submit(client, [{"cidr": "10.0.0.0/25", "action": "deny"}])
+    target = _submit(client, [{"cidr": "10.0.0.0/24", "action": "deny"}])
+    data = _diff(client, base, target).json()
+    # The first /25 denies in both versions (no change); the second half gains a rule.
+    assert len(data["changes"]) == 1
+    change = data["changes"][0]
+    assert change["change_type"] == "none_to_deny"
+    assert change["cidrs"] == ["10.0.0.128/25"]
+    assert change["address_count"] == 128
+
+
+def test_diff_merges_only_same_type_adjacent_ranges(client: TestClient) -> None:
+    base = _submit(client, [{"cidr": "10.0.0.0/24", "action": "permit"}])
+    # Two adjacent deny halves with an unchanged permit island between them:
+    #   10.0.0.0/25      permit -> deny
+    #   10.0.0.128/26    permit -> permit (must block merging)
+    #   10.0.0.192/26    permit -> deny
+    target = _submit(client, [
+        {"cidr": "10.0.0.0/24", "action": "permit"},
+        {"cidr": "10.0.0.0/25", "action": "deny"},
+        {"cidr": "10.0.0.192/26", "action": "deny"},
+    ])
+    changes = _diff(client, base, target).json()["changes"]
+    assert all(c["change_type"] == "permit_to_deny" for c in changes)
+    # Same type, but not adjacent (an unchanged /26 lies between) -> two ranges.
+    assert {tuple(c["cidrs"]) for c in changes} == {("10.0.0.0/25",), ("10.0.0.192/26",)}
+
+    # Adjacent same-type halves DO coalesce into one minimal CIDR range.
+    target2 = _submit(client, [
+        {"cidr": "10.0.0.0/25", "action": "deny"},
+        {"cidr": "10.0.0.128/25", "action": "deny"},
+    ])
+    changes2 = _diff(client, base, target2).json()["changes"]
+    assert len(changes2) == 1
+    assert changes2[0]["cidrs"] == ["10.0.0.0/24"]
+    assert changes2[0]["address_count"] == 256
+
+
+def test_diff_different_types_never_merge(client: TestClient) -> None:
+    base = _submit(client, [{"cidr": "10.0.0.0/24", "action": "permit"}])
+    # First half gains a deny rule (permit -> deny); the rule covering the
+    # second half is removed (permit -> none).  The two change ranges are
+    # adjacent but of different types and must stay separate.
+    target = _submit(client, [{"cidr": "10.0.0.0/25", "action": "deny"}])
+    changes = _diff(client, base, target).json()["changes"]
+    types = sorted(c["change_type"] for c in changes)
+    assert types == ["permit_to_deny", "permit_to_none"]
+    assert all(c["cidrs"] != ["10.0.0.0/24"] for c in changes)
+
+
+def test_diff_effective_fragments_of_nested_rules(client: TestClient) -> None:
+    # Parent permit /24 with a deny child /25 in both versions; only the
+    # parent's second half changes permit -> deny in the target.
+    base = _submit(client, [
+        {"cidr": "10.0.0.0/24", "action": "permit"},
+        {"cidr": "10.0.0.0/25", "action": "deny"},
+    ])
+    target = _submit(client, [
+        {"cidr": "10.0.0.0/24", "action": "deny"},
+        {"cidr": "10.0.0.0/25", "action": "deny"},
+    ])
+    changes = _diff(client, base, target).json()["changes"]
+    assert len(changes) == 1
+    assert changes[0]["change_type"] == "permit_to_deny"
+    # The parent's effective range in the base is exactly the second /25.
+    assert changes[0]["cidrs"] == ["10.0.0.128/25"]
+
+
+def test_diff_ipv6_counts_and_independence(client: TestClient) -> None:
+    base = _submit(client, [{"cidr": "10.0.0.0/24", "action": "permit"}])
+    target = _submit(client, [
+        {"cidr": "10.0.0.0/24", "action": "permit"},
+        {"cidr": "2001:db8::/32", "action": "deny"},
+    ])
+    data = _diff(client, base, target).json()
+    assert data["ipv4"]["changed_addresses"] == 0
+    assert data["ipv6"]["changed_addresses"] == 2 ** 96
+    v6_changes = [c for c in data["changes"] if c["ip_version"] == 6]
+    assert len(v6_changes) == 1
+    assert v6_changes[0]["change_type"] == "none_to_deny"
+    assert v6_changes[0]["cidrs"] == ["2001:db8::/32"]
+    assert v6_changes[0]["address_count"] == 2 ** 96
+
+
+def test_diff_disjoint_covered_universes(client: TestClient) -> None:
+    base = _submit(client, [{"cidr": "10.0.0.0/24", "action": "permit"}])
+    other = _submit(client, [{"cidr": "192.168.0.0/24", "action": "permit"}])
+    data = _diff(client, base, other).json()
+    # Disjoint universes: each side's block changes none <-> permit.
+    assert data["total_changed_addresses"] == 512
+    assert {c["change_type"] for c in data["changes"]} == {
+        "none_to_permit",
+        "permit_to_none",
+    }
+
+
+def test_diff_same_id_returns_400(client: TestClient) -> None:
+    aid = _submit(client, [{"cidr": "10.0.0.0/24", "action": "permit"}])
+    r = _diff(client, aid, aid)
+    assert r.status_code == 400
+    assert "different" in r.json()["detail"]
+
+
+def test_diff_malformed_id_returns_400(client: TestClient) -> None:
+    aid = _submit(client, [{"cidr": "10.0.0.0/24", "action": "permit"}])
+    for bad in ("an_xyz", "AN_0123456789abcdef", "1234567890abcdef", "an_0123456789abcdef0", "nope"):
+        r = _diff(client, aid, bad)
+        assert r.status_code == 400, (bad, r.status_code, r.text)
+        assert "invalid target" in r.json()["detail"]
+        r = _diff(client, bad, aid)
+        assert r.status_code == 400, (bad, r.status_code, r.text)
+        assert "invalid base" in r.json()["detail"]
+
+
+def test_diff_nonexistent_id_returns_404(client: TestClient) -> None:
+    aid = _submit(client, [{"cidr": "10.0.0.0/24", "action": "permit"}])
+    missing = "an_0000000000000000"
+    assert missing != aid
+    r = _diff(client, aid, missing)
+    assert r.status_code == 404
+    assert missing in r.json()["detail"]
+    r = _diff(client, missing, aid)
+    assert r.status_code == 404
+    assert missing in r.json()["detail"]
+
+
+def test_diff_missing_query_params_422_and_route_shadowing(client: TestClient) -> None:
+    aid = _submit(client, [{"cidr": "10.0.0.0/24", "action": "permit"}])
+    assert client.get("/api/analyses/diff", params={"base": aid}).status_code == 422
+    # The literal 'diff' must still not be captured by the {analysis_id} route.
+    assert client.get("/api/analyses/diff").status_code == 422
+    assert client.get("/api/analyses/diff/rules").status_code == 404
